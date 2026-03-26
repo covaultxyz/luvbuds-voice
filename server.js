@@ -14,16 +14,27 @@ const PORT = process.env.PORT || 8300;
 // Config from environment
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const AUTH_CODE = process.env.AUTH_CODE || "meridian";
+// Department-based auth codes
+const AUTH_CODES = {
+  sales2026: { dept: "sales", name: "Sales" },
+  accounting2026: { dept: "accounting", name: "Accounting" },
+  leadership2026: { dept: "leadership", name: "Leadership" },
+  [process.env.AUTH_CODE || "luvbuds2026"]: { dept: "all", name: "General" },
+};
+const AUTH_CODE = process.env.AUTH_CODE || "luvbuds2026"; // legacy compat
 const GATEWAY_URL = process.env.GATEWAY_URL || "";
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "";
 
 // ============== Customer Knowledge Retrieval (RAG) ==============
-async function queryCustomerKnowledge(userMessage) {
+async function queryCustomerKnowledge(userMessage, department) {
   if (!GATEWAY_URL || !GATEWAY_API_KEY) return "";
   try {
     const q = encodeURIComponent(userMessage.slice(0, 200));
-    const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=5`;
+    // Increase limit and optionally filter by department-relevant categories
+    const categoryFilter = department === "sales"
+      ? "&category=products"  // TODO: multi-category filter when Gateway supports it
+      : "";
+    const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=10${categoryFilter}`;
     const resp = await fetch(url, {
       headers: { "X-API-Key": GATEWAY_API_KEY },
       signal: AbortSignal.timeout(3000),
@@ -32,10 +43,16 @@ async function queryCustomerKnowledge(userMessage) {
     const results = await resp.json();
     if (!results.length) return "";
     const context = results
-      .map((r) => `[${r.category}] ${r.title}${r.excerpt ? ": " + r.excerpt : ""}`)
+      .map((r) => {
+        let line = `[${r.category.replace(/_/g, " ")}] ${r.title}`;
+        if (r.excerpt && r.excerpt !== r.title && r.excerpt.length > 5) {
+          line += ` — ${r.excerpt.slice(0, 150)}`;
+        }
+        return line;
+      })
       .join("\n");
-    console.log(`[meridian-voice] RAG: ${results.length} results for "${userMessage.slice(0, 40)}..."`);
-    return `\n\nRELEVANT CUSTOMER DATA (from their knowledge base — use this to give specific, informed answers):\n${context}`;
+    console.log(`[meridian-voice] RAG: ${results.length} results for "${userMessage.slice(0, 40)}..." (dept: ${department || "all"})`);
+    return `\n\nRELEVANT CUSTOMER DATA (from LuvBuds knowledge base — answer from this data):\n${context}`;
   } catch (e) {
     console.warn(`[meridian-voice] RAG query failed: ${e.message}`);
     return "";
@@ -170,8 +187,11 @@ function extractLeadInfo(text) {
 }
 
 // ============== Session Persistence ==============
-function loadSessionFromTranscript(sessionId) {
-  const logFile = path.join(TRANSCRIPTS_DIR, `${sessionId}.jsonl`);
+function loadSessionFromTranscript(workspaceId, sessionId) {
+  // Try workspace-scoped first, then legacy flat
+  const wsFile = path.join(TRANSCRIPTS_DIR, workspaceId || "demo", `${sessionId}.jsonl`);
+  const legacyFile = path.join(TRANSCRIPTS_DIR, `${sessionId}.jsonl`);
+  const logFile = fs.existsSync(wsFile) ? wsFile : legacyFile;
   try {
     if (!fs.existsSync(logFile)) return [];
     const lines = fs.readFileSync(logFile, "utf-8").trim().split("\n").filter(Boolean);
@@ -191,20 +211,23 @@ function loadSessionFromTranscript(sessionId) {
 const TRANSCRIPTS_DIR = path.join(__dirname, "transcripts");
 if (!fs.existsSync(TRANSCRIPTS_DIR)) fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
 
-function logTranscript(sessionId, userMessage, aiResponse, timing) {
-  const logFile = path.join(TRANSCRIPTS_DIR, `${sessionId}.jsonl`);
+function logTranscript(workspaceId, sessionId, userMessage, aiResponse, timing) {
+  // Workspace-scoped transcript directory
+  const wsDir = path.join(TRANSCRIPTS_DIR, workspaceId || "demo");
+  if (!fs.existsSync(wsDir)) fs.mkdirSync(wsDir, { recursive: true });
+  const logFile = path.join(wsDir, `${sessionId}.jsonl`);
   const entry = { timestamp: new Date().toISOString(), user: userMessage, oracle: aiResponse, timing };
   fs.appendFileSync(logFile, JSON.stringify(entry) + "\n", "utf-8");
 
-  // AgentVox DB bridge
-  recordExchange(sessionId, userMessage, aiResponse, timing);
+  // AgentVox DB bridge (workspace-scoped)
+  recordExchange(workspaceId, sessionId, userMessage, aiResponse, timing);
 
   // Auto lead extraction
   if (!extractedSessions.has(sessionId)) {
     const lead = extractLeadInfo(userMessage);
     if (lead.email || lead.phone || lead.name) {
       saveLead({ ...lead, notes: `Auto-extracted from session ${sessionId}` });
-      recordLead(sessionId, lead);
+      recordLead(workspaceId, sessionId, lead);
       extractedSessions.add(sessionId);
       console.log(`[meridian-voice] Auto-extracted lead: ${lead.name || lead.email || lead.phone}`);
     }
@@ -292,14 +315,77 @@ setTimeout(async () => {
 }, 2000);
 
 // ============== Auth ==============
+const VOICE_API_URL = process.env.VOICE_API_URL || "http://127.0.0.1:8100";
+
+// Legacy code-based auth
 app.post("/api/auth", (req, res) => {
   const { code } = req.body;
-  if (code === AUTH_CODE) {
-    res.json({ success: true });
+  const match = AUTH_CODES[code];
+  if (match) {
+    res.json({ success: true, department: match.dept, departmentName: match.name, workspaceId: "demo" });
   } else {
     res.status(401).json({ success: false, error: "Invalid code" });
   }
 });
+
+// JWT registration — proxies to voice API
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { email, password, companyName } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+    const resp = await fetch(`${VOICE_API_URL}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, display_name: companyName || email.split("@")[0] }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return res.status(resp.status).json(data);
+    console.log(`[meridian-voice] Registered: ${email} → workspace ${data.workspaceId || data.workspace_id}`);
+    res.json({
+      token: data.token,
+      user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: companyName || "" },
+    });
+  } catch (e) {
+    res.status(502).json({ error: "Registration service unavailable" });
+  }
+});
+
+// JWT login — proxies to voice API
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+    const resp = await fetch(`${VOICE_API_URL}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return res.status(resp.status).json(data);
+    res.json({
+      token: data.token,
+      user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: data.displayName || "" },
+    });
+  } catch (e) {
+    res.status(502).json({ error: "Login service unavailable" });
+  }
+});
+
+// Extract workspace from JWT, body, header, or fallback to demo
+function extractWorkspace(req) {
+  if (req.body?.workspaceId) return req.body.workspaceId;
+  const auth = req.headers.authorization?.replace("Bearer ", "") || "";
+  if (auth.includes(".")) {
+    try {
+      const payload = JSON.parse(Buffer.from(auth.split(".")[1], "base64").toString());
+      if (payload.workspace_id) return payload.workspace_id;
+    } catch {}
+  }
+  if (req.headers["x-workspace-id"]) return req.headers["x-workspace-id"];
+  return "demo";
+}
 
 // ============== Lead Capture Endpoint ==============
 app.post("/api/lead", (req, res) => {
@@ -318,10 +404,12 @@ app.post("/api/lead", (req, res) => {
 });
 
 // ============== Conversation Sessions ==============
+// Sessions track history + department (set at auth time)
 const sessions = new Map();
+const sessionDepartments = new Map(); // sessionId → department string
 
-// ============== NEPQ System Prompt ==============
-function getSystemPrompt() {
+// ============== LuvBuds Intelligence Assistant Prompt ==============
+function getSystemPrompt(department) {
   const now = new Date();
   const currentDate = now.toLocaleDateString("en-US", {
     weekday: "long",
@@ -336,110 +424,81 @@ function getSystemPrompt() {
     timeZone: "America/New_York",
   });
 
-  return `You are Oracle, a senior business strategist at Meridian AI. You're on a voice call — keep every response to 1-3 short sentences. Sound like a sharp, curious friend who knows AI cold — never like a salesperson.
+  const base = `You are the LuvBuds Intelligence Assistant — an internal AI that helps LuvBuds team members find information from company systems.
+
+You're on a voice call. Keep responses concise and specific.
 
 VOICE RULES:
-- 1-3 sentences max. This is a phone call, not an email.
-- Ask ONE question at a time. Wait for their answer.
-- Mirror their energy. If they're casual, be casual. If they're serious, match it.
-- Use natural phrases: "that's interesting", "tell me more", "I hear you", "walk me through that"
-- NEVER list features, use bullet points, or monologue.
-- If they ask a question, answer it directly in one sentence, then ask one back.
-- PRONUNCIATION: This is read aloud by text-to-speech. Say "A.P.I.s" not "APIs", "A.I." not "AI", "K.P.I.s" not "KPIs".
+- 1-4 sentences for simple lookups. More detail if they ask to elaborate.
+- Answer directly from the RELEVANT CUSTOMER DATA section below. That's your source of truth.
+- Be specific: cite vendor names, product names, order numbers, dollar amounts when available.
+- If the data doesn't contain the answer, say "I don't have that data loaded yet — I can look it up if we add it to the system."
+- NEVER fabricate data, numbers, or names. Only state what's in the search results.
+- PRONUNCIATION: Say "P.O." not "PO", "S.K.U." not "SKU", "K.P.I." not "KPI", "A.P.I." not "API".
+- When listing items, read the top 3-5 and say "and X more" for the rest.
 
-CONVERSATION FLOW (NEPQ — Neuro-Emotional Persuasion Questions):
-Guide the conversation through these phases naturally. Spend 60-70% of time in phases 2-4. Never rush.
+COMPANY CONTEXT:
+- LuvBuds is a smoke shop distribution and retail company
+- Systems: Microsoft Dynamics 365 (E.R.P.), Notion (tasks/docs), BigCommerce (e-commerce)
+- Data loaded: 92,000+ records including products, vendors, purchase orders, sales orders, tasks, decisions
+- Brands include: Blazer, Stache, and many more across smoke shop product categories
 
-Phase 1 — CONNECTION (first 1-2 exchanges):
-Understand why they're here. Be curious, not salesy.
-- "What got you interested in checking this out?"
-- "Have you been exploring AI for your business, or is this more new territory?"
-- "What's your world like — what kind of business are you running?"
+WHAT YOU CAN ANSWER:
+- Product lookups: names, brands, categories, S.K.U.s
+- Vendor info: who supplies what, contact details if available
+- Purchase orders: P.O. counts, line items, vendor spend
+- Sales orders: order volumes, trends (52,000+ orders loaded)
+- Tasks and decisions: what's in progress, what was decided
+- Documents: internal docs, S.O.P.s, meeting notes`;
 
-Phase 2 — SITUATION (3-4 questions):
-Learn their world before diagnosing anything.
-- What's their business? How many people, locations, customers?
-- What tools are they using? What does their process look like?
-- "Walk me through how that works for you today"
-- "How long have you been doing it that way?"
+  const salesContext = `
 
-Phase 3 — PROBLEM AWARENESS (the core — stay here):
-Find the REAL pain. Don't accept surface answers. Dig.
-- "What's the biggest headache in your day-to-day right now?"
-- "How is that affecting your bottom line?"
-- "How long has that been going on?"
-- "What do you think is causing it?"
-- Go deeper: "Tell me more about that" / "What do you mean?" / "Can you give me a specific example?"
-- Ask about impact: "Is that affecting you personally too, or is it more of a business thing?"
+SALES TEAM FOCUS:
+- Help with: product availability, brand info, customer questions, pricing lookups, competitor product comparisons
+- When asked about "best sellers" or "top products": look for products with the most sales orders or mentions
+- Connect product questions to vendor and procurement data when useful
+- If asked about margins, say "I have product and P.O. cost data — let me check what's available"`;
 
-Phase 4 — SOLUTION AWARENESS (2-3 questions):
-What have they already tried?
-- "What have you done about it so far?"
-- "What worked? What didn't?"
-- "If you could snap your fingers and fix one thing tomorrow, what would it be?"
+  const accountingContext = `
 
-Phase 5 — CONSEQUENCE (1-2 questions, only after deep problem exploration):
-- "What happens if nothing changes in the next 6 months?"
-- "How much do you think this is costing you — roughly?"
+ACCOUNTING TEAM FOCUS:
+- Help with: P.O. status, vendor spend analysis, payment tracking, cost breakdowns, order reconciliation
+- When asked about totals or aggregates: cite the data you have and note if it's partial
+- 20,000+ P.O. line items and 3,598 purchase orders are loaded
+- 1,674 vendor records and 492 account records available
+- If asked about invoices or payments not in the data, say "that level of detail needs the Dynamics dashboard"`;
 
-Phase 6 — HOW MERIDIAN HELPS (only when you deeply understand THEIR problems):
-Connect their SPECIFIC pain to SPECIFIC Meridian capabilities. Never generic. Reference the real examples below.
+  const leadershipContext = `
 
-WHAT MERIDIAN DOES:
-We build AI operating systems for businesses. Not chatbots — full intelligence layers that listen to every conversation, remember everything permanently, and act on it.
+LEADERSHIP FOCUS:
+- Help with: high-level summaries, cross-department questions, strategic data
+- You have visibility across all departments: sales, accounting, operations
+- When asked for overviews, pull from multiple categories
+- Flag when data is incomplete: "We have 52,000 sales orders loaded but not the line-item detail yet"`;
 
-Voice AI — Handles inbound and outbound calls. Speaks English and Spanish natively. Remembers every caller across every interaction (not just that call). Replaces SDRs at a fraction of the cost.
+  let prompt = base;
+  if (department === "sales") prompt += salesContext;
+  else if (department === "accounting") prompt += accountingContext;
+  else if (department === "leadership") prompt += leadershipContext;
+  else prompt += salesContext + accountingContext;
 
-Persistent Memory — A knowledge graph that stores every conversation, every client interaction, every insight. Your team asks a question, gets an answer with full context. Unlike ChatGPT, it never forgets and connects dots across thousands of interactions.
-
-Call Intelligence — Every sales conversation recorded, transcribed, scored against your ideal script. See which reps follow the process, which questions get skipped, which objections go unhandled. Patterns emerge across your whole operation.
-
-Top Performer Cloning — Record your best closers, extract what makes them win, generate AI-simulated prospects at different difficulty levels so new hires can practice before touching a real lead.
-
-KPI Dashboards — Real-time visibility via Telegram. Tap a button, see your numbers. AI alerts when metrics change. No new app to install.
-
-Franchise/Multi-Location Intelligence — One brain across all locations. See why your top locations win and your bottom locations struggle. Cross-location benchmarks that no other tool provides.
-
-WHAT WE CANNOT CLAIM:
-- Do NOT say we have "case studies" or "proven results with X client." We are early-stage. Be honest.
-- Do NOT invent customer stories, testimonials, or specific ROI numbers from past clients.
-- If asked about track record, say: "We're a small focused team building custom systems. We can show you what it looks like for your specific situation."
-- Frame capabilities as what we CAN build, not what we've done. Use "for a business like yours, this could mean..." not "we did this for X client."
-
-VS GOHIGHLEVEL (only if they bring it up):
-GHL is a marketing platform with voice bolted on. We build from scratch. GHL forgets between calls, we remember. GHL treats locations as islands, we connect them. But be fair — GHL has strengths too.
-
-PRICING (only if asked — every project is custom):
-- Starter: around $1,500/mo
-- Professional: around $3,000/mo
-- Enterprise: $5,000+/mo
-
-CONTACT INFO & NEXT STEP:
-- Team: Alexander Mazzei (CEO/architect), Ely Beckman (CTO/engineer)
-- Next step: 60-minute discovery call. We map their operations and deliver a written assessment within 48 hours. No commitment.
-- Only mention this when the conversation is naturally winding down or they ask.
-
-CRITICAL RULES:
-- Do NOT bring up pricing unless they ask.
-- Do NOT ask for contact info in the first 8+ exchanges. Only when you've deeply explored their problems and they seem genuinely engaged.
-- When it's time, say something natural like: "I'd honestly love to dig deeper into this with our team — what's the best way to follow up with you?"
-- If they ask what Meridian does early, give a one-sentence answer and redirect: "We build AI systems that remember everything about your business and act on it — but I'd rather understand what you're dealing with first. What's going on in your world?"
-- Be honest about what we can and can't do. If something isn't our strength, say so.
-- NEVER fabricate case studies, customer stories, testimonials, or ROI numbers. We are early-stage. Own it.
-- If unsure, say "that's something our team could dig into on a discovery call."
-
-Current date: ${currentDate}
-Current time: ${currentTime} ET`;
+  prompt += `\n\nCurrent date: ${currentDate}\nCurrent time: ${currentTime} ET`;
+  return prompt;
 }
 
 // ============== Main Voice Endpoint ==============
 app.post("/api/voice", async (req, res) => {
   const authHeader = req.headers.authorization;
-  if (authHeader !== `Bearer ${AUTH_CODE}`) {
+  const tokenNS = authHeader?.replace("Bearer ", "") || "";
+  const authMatchNS = AUTH_CODES[tokenNS];
+  if (!authMatchNS) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { audio, sessionId, voice } = req.body;
+  if (sessionId && authMatchNS.dept) {
+    sessionDepartments.set(sessionId, authMatchNS.dept);
+  }
   const selectedVoice = voice || "nova";
 
   if (!audio) {
@@ -480,7 +539,8 @@ app.post("/api/voice", async (req, res) => {
 
     // 4. Get AI response from Groq LLM
     const aiStart = Date.now();
-    const response = await getAIResponse(transcript, history);
+    const deptNonStream = sessionDepartments.get(sessionId) || "all";
+    const response = await getAIResponse(transcript, history, deptNonStream);
     const aiTime = Date.now() - aiStart;
     console.log(`[meridian-voice] AI (${aiTime}ms): "${response}"`);
 
@@ -522,11 +582,17 @@ app.post("/api/voice", async (req, res) => {
 // ============== Streaming Voice Endpoint ==============
 app.post("/api/voice/stream", async (req, res) => {
   const authHeader = req.headers.authorization;
-  if (authHeader !== `Bearer ${AUTH_CODE}`) {
+  const token = authHeader?.replace("Bearer ", "") || "";
+  const authMatch = AUTH_CODES[token];
+  if (!authMatch) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { audio, transcript: clientTranscript, sessionId, voice } = req.body;
+  // Track department per session
+  if (sessionId && authMatch.dept) {
+    sessionDepartments.set(sessionId, authMatch.dept);
+  }
   const selectedVoice = voice || "nova";
 
   if (!audio && !clientTranscript) {
@@ -584,8 +650,9 @@ app.post("/api/voice/stream", async (req, res) => {
     console.log(`[meridian-voice/stream] Streaming AI response...`);
 
     // RAG: query customer knowledge base before LLM call
-    const ragContext = await queryCustomerKnowledge(transcript);
-    const systemPrompt = getSystemPrompt() + ragContext;
+    const dept = sessionDepartments.get(sessionId) || "all";
+    const ragContext = await queryCustomerKnowledge(transcript, dept);
+    const systemPrompt = getSystemPrompt(dept) + ragContext;
 
     // Stream from Groq LLM
     const stream = await groq.chat.completions.create({
@@ -705,9 +772,9 @@ async function speechToText(audioBuffer) {
 }
 
 // ============== Chat: Groq LLM ==============
-async function getAIResponse(userMessage, history) {
-  const ragContext = await queryCustomerKnowledge(userMessage);
-  const systemPrompt = getSystemPrompt() + ragContext;
+async function getAIResponse(userMessage, history, department) {
+  const ragContext = await queryCustomerKnowledge(userMessage, department);
+  const systemPrompt = getSystemPrompt(department) + ragContext;
 
   const response = await groq.chat.completions.create({
     model: CHAT_MODEL,
