@@ -24,39 +24,215 @@ const AUTH_CODES = {
 const AUTH_CODE = process.env.AUTH_CODE || "luvbuds2026"; // legacy compat
 const GATEWAY_URL = process.env.GATEWAY_URL || "";
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "";
+const KPI_DASHBOARD_URL = process.env.KPI_DASHBOARD_URL || "https://kpi-dashboard-8fj4.onrender.com";
+const KPI_DASHBOARD_AUTH = process.env.KPI_DASHBOARD_AUTH || "";  // "admin:password" format
 
 // ============== Customer Knowledge Retrieval (RAG) ==============
+
+// Stats cache: fetched once per 10 minutes, gives the LLM awareness of available data
+let statsCache = null;
+let statsCacheTime = 0;
+const STATS_TTL = 10 * 60 * 1000; // 10 minutes
+
+async function fetchStats() {
+  if (statsCache && Date.now() - statsCacheTime < STATS_TTL) return statsCache;
+  if (!GATEWAY_URL || !GATEWAY_API_KEY) return null;
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/v1/customer/stats`, {
+      headers: { "X-API-Key": GATEWAY_API_KEY },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    statsCache = await resp.json();
+    statsCacheTime = Date.now();
+    return statsCache;
+  } catch (e) {
+    console.warn(`[meridian-voice] Stats fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+function formatStatsContext(stats) {
+  if (!stats) return "";
+  // Accept either {categories: [...]} or flat array format
+  const cats = Array.isArray(stats) ? stats : stats.categories || stats.breakdown || [];
+  if (!cats.length) return "";
+  const lines = cats
+    .sort((a, b) => (b.count || 0) - (a.count || 0))
+    .map((c) => `  ${(c.category || c.type || c.name || "unknown").replace(/_/g, " ")}: ${c.count?.toLocaleString() || "?"} records`)
+    .join("\n");
+  return `\nDATA AVAILABLE IN SYSTEM:\n${lines}\n`;
+}
+
+// Detect analytical questions that need multi-category or aggregation context
+function isAnalyticalQuery(message) {
+  const patterns = /\b(top|best|most|least|how many|total|sum|average|count|trend|compare|revenue|sales volume|biggest|highest|lowest|ranking|rank)\b/i;
+  return patterns.test(message);
+}
+
+// Department-relevant categories for targeted sub-searches
+const DEPT_CATEGORIES = {
+  sales: ["products", "dynamics_sales_orders", "brands", "dynamics_vendors"],
+  accounting: ["dynamics_purchase_orders", "dynamics_po_lines", "dynamics_vendors", "dynamics_accounts", "dynamics_sales_orders"],
+  leadership: ["dynamics_sales_orders", "dynamics_purchase_orders", "products", "decisions", "tasks"],
+  all: ["products", "dynamics_sales_orders", "dynamics_purchase_orders", "dynamics_vendors"],
+};
+
+async function searchGateway(query, limit = 10, category = "") {
+  const q = encodeURIComponent(query.slice(0, 200));
+  const catParam = category ? `&category=${category}` : "";
+  const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=${limit}${catParam}`;
+  const resp = await fetch(url, {
+    headers: { "X-API-Key": GATEWAY_API_KEY },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!resp.ok) return [];
+  return resp.json();
+}
+
 async function queryCustomerKnowledge(userMessage, department) {
   if (!GATEWAY_URL || !GATEWAY_API_KEY) return "";
   try {
-    const q = encodeURIComponent(userMessage.slice(0, 200));
-    // Increase limit and optionally filter by department-relevant categories
-    const categoryFilter = department === "sales"
-      ? "&category=products"  // TODO: multi-category filter when Gateway supports it
-      : "";
-    const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=10${categoryFilter}`;
-    const resp = await fetch(url, {
-      headers: { "X-API-Key": GATEWAY_API_KEY },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!resp.ok) return "";
-    const results = await resp.json();
-    if (!results.length) return "";
-    const context = results
+    // Prefetch stats (cached, non-blocking after first call)
+    const statsPromise = fetchStats();
+
+    const analytical = isAnalyticalQuery(userMessage);
+    const searches = [];
+
+    // Primary search: full query, no category filter, broad results
+    searches.push(searchGateway(userMessage, analytical ? 15 : 10));
+
+    // For analytical questions: add targeted category sub-searches
+    if (analytical) {
+      const deptCats = DEPT_CATEGORIES[department] || DEPT_CATEGORIES.all;
+      // Extract key terms for focused sub-searches
+      const keyTerms = userMessage
+        .replace(/\b(what|are|our|the|how|many|top|best|most|show|me|do|we|have|is|can|you|tell|about|give|list)\b/gi, "")
+        .trim();
+      if (keyTerms.length > 2) {
+        // Search top 2 most relevant categories with focused terms
+        for (const cat of deptCats.slice(0, 2)) {
+          searches.push(searchGateway(keyTerms, 5, cat));
+        }
+      }
+    }
+
+    // Execute all searches in parallel
+    const searchResults = await Promise.all(searches);
+
+    // Deduplicate by title
+    const seen = new Set();
+    const allResults = [];
+    for (const results of searchResults) {
+      if (!Array.isArray(results)) continue;
+      for (const r of results) {
+        const key = `${r.category}:${r.title}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          allResults.push(r);
+        }
+      }
+    }
+
+    if (!allResults.length) return "";
+
+    // Format results with category labels
+    const context = allResults
+      .slice(0, 20) // cap at 20 to avoid prompt bloat
       .map((r) => {
-        let line = `[${r.category.replace(/_/g, " ")}] ${r.title}`;
+        let line = `[${(r.category || "unknown").replace(/_/g, " ")}] ${r.title}`;
         if (r.excerpt && r.excerpt !== r.title && r.excerpt.length > 5) {
-          line += ` — ${r.excerpt.slice(0, 150)}`;
+          line += ` — ${r.excerpt.slice(0, 200)}`;
         }
         return line;
       })
       .join("\n");
-    console.log(`[meridian-voice] RAG: ${results.length} results for "${userMessage.slice(0, 40)}..." (dept: ${department || "all"})`);
-    return `\n\nRELEVANT CUSTOMER DATA (from LuvBuds knowledge base — answer from this data):\n${context}`;
+
+    // Build stats context
+    const stats = await statsPromise;
+    const statsContext = formatStatsContext(stats);
+
+    console.log(`[meridian-voice] RAG: ${allResults.length} results (${searches.length} queries, analytical: ${analytical}) for "${userMessage.slice(0, 40)}..." (dept: ${department || "all"})`);
+    return `${statsContext}\nRELEVANT CUSTOMER DATA (from LuvBuds knowledge base — answer from this data):\n${context}`;
   } catch (e) {
     console.warn(`[meridian-voice] RAG query failed: ${e.message}`);
     return "";
   }
+}
+
+// ============== KPI Dashboard Data Retrieval ==============
+async function queryKPIDashboard(userMessage) {
+  if (!KPI_DASHBOARD_URL || !KPI_DASHBOARD_AUTH) return "";
+  const msg = userMessage.toLowerCase();
+
+  // Route to the most relevant KPI endpoint based on the question
+  const queries = [];
+  if (msg.match(/sales|revenue|invoic|month|total|mtd|ytd|quarter/)) {
+    queries.push({ url: "/api/cache/monthly-totals", label: "Monthly Sales Totals" });
+  }
+  if (msg.match(/customer|account|top.*client|biggest.*buyer|parent.*company/)) {
+    queries.push({ url: "/api/cache/parent-companies?limit=10", label: "Top Customers" });
+  }
+  if (msg.match(/compare|month.*over|growth|trend|change|vs|versus/)) {
+    queries.push({ url: "/api/cache/month-over-month", label: "Month-over-Month Comparison" });
+  }
+  if (msg.match(/margin|profit|cost|cogs|gross/)) {
+    queries.push({ url: "/api/cache/margin-analysis", label: "Margin Analysis" });
+  }
+  if (msg.match(/inventory|stock|on.hand|velocity|reorder/)) {
+    queries.push({ url: "/api/cache/inventory-velocity?leadTime=14", label: "Inventory Velocity" });
+  }
+  if (msg.match(/scorecard|pva|goal|target|performance/)) {
+    queries.push({ url: "/api/cache/pva-scorecard", label: "PVA Scorecard" });
+  }
+  if (msg.match(/open.*order|backorder|pending|shipment/)) {
+    queries.push({ url: "/api/cache/open-orders", label: "Open Orders" });
+  }
+
+  if (queries.length === 0) return ""; // No KPI-relevant question
+
+  const authHeader = "Basic " + Buffer.from(KPI_DASHBOARD_AUTH).toString("base64");
+  const results = [];
+
+  for (const q of queries.slice(0, 2)) { // Max 2 KPI queries per turn
+    try {
+      const resp = await fetch(`${KPI_DASHBOARD_URL}${q.url}`, {
+        headers: { Authorization: authHeader },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      if (!data.success && !data.data) continue;
+
+      // Summarize the data for the LLM (don't dump raw JSON)
+      const payload = data.data || data;
+      let summary = `[${q.label}]\n`;
+
+      if (Array.isArray(payload)) {
+        // Take recent entries (last 3 months for monthly data)
+        const recent = payload.slice(-3);
+        summary += recent.map((r) => {
+          if (r.month && r.totalSales) {
+            return `${r.month}: $${(r.totalSales/1000).toFixed(0)}K sales, ${(r.totalUnits||0).toLocaleString()} units, ${r.skuCount||'?'} SKUs`;
+          }
+          if (r.parentName && r.totalRevenue) {
+            return `${r.parentName.split('|')[0].trim()}: $${(r.totalRevenue/1000).toFixed(0)}K revenue, ${r.totalOrders} orders`;
+          }
+          return JSON.stringify(r).slice(0, 150);
+        }).join("\n");
+      } else if (typeof payload === "object") {
+        summary += JSON.stringify(payload).slice(0, 400);
+      }
+
+      results.push(summary);
+      console.log(`[meridian-voice] KPI: ${q.label} returned data`);
+    } catch (e) {
+      console.warn(`[meridian-voice] KPI query failed (${q.url}): ${e.message}`);
+    }
+  }
+
+  if (results.length === 0) return "";
+  return `\n\nLIVE KPI DATA (from Dynamics 365 ETL — real numbers, updated daily):\n${results.join("\n\n")}`;
 }
 
 if (!GROQ_API_KEY) {
@@ -336,7 +512,7 @@ app.post("/api/auth/register", async (req, res) => {
     const resp = await fetch(`${VOICE_API_URL}/api/v1/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password, display_name: companyName || email.split("@")[0] }),
+      body: JSON.stringify({ email, password, name: companyName || email.split("@")[0] }),
       signal: AbortSignal.timeout(10000),
     });
     const data = await resp.json();
@@ -426,13 +602,12 @@ function getSystemPrompt(department) {
 
   const base = `You are the LuvBuds Intelligence Assistant — an internal AI that helps LuvBuds team members find information from company systems.
 
-You're on a voice call. Keep responses concise and specific.
+You're on a voice call. Keep responses concise, specific, and action-oriented.
 
 VOICE RULES:
 - 1-4 sentences for simple lookups. More detail if they ask to elaborate.
-- Answer directly from the RELEVANT CUSTOMER DATA section below. That's your source of truth.
+- Answer directly from the RELEVANT CUSTOMER DATA section below — that's your source of truth.
 - Be specific: cite vendor names, product names, order numbers, dollar amounts when available.
-- If the data doesn't contain the answer, say "I don't have that data loaded yet — I can look it up if we add it to the system."
 - NEVER fabricate data, numbers, or names. Only state what's in the search results.
 - PRONUNCIATION: Say "P.O." not "PO", "S.K.U." not "SKU", "K.P.I." not "KPI", "A.P.I." not "API".
 - When listing items, read the top 3-5 and say "and X more" for the rest.
@@ -447,17 +622,26 @@ WHAT YOU CAN ANSWER:
 - Product lookups: names, brands, categories, S.K.U.s
 - Vendor info: who supplies what, contact details if available
 - Purchase orders: P.O. counts, line items, vendor spend
-- Sales orders: order volumes, trends (52,000+ orders loaded)
+- Sales orders: order volumes, sales data (52,000+ orders loaded)
 - Tasks and decisions: what's in progress, what was decided
-- Documents: internal docs, S.O.P.s, meeting notes`;
+- Documents: internal docs, S.O.P.s, meeting notes
+
+HOW TO HANDLE ANALYTICAL QUESTIONS (top sellers, totals, rankings):
+- The search results below are a SAMPLE from the knowledge base, not the full dataset.
+- When asked about "top" or "best" items: report what you see in the search results and say "based on the records I can see." Do NOT say you don't have the data if results ARE present below — work with what you have.
+- When asked about counts or totals: if the DATA AVAILABLE section shows record counts, cite those. For specific filtered counts, work from the search results.
+- If the search results genuinely don't contain relevant data, say "That specific breakdown isn't in the data I can search right now — we'd need to add it to the system."
+- NEVER say "I don't have sales data" when sales order records appear in the results below.`;
 
   const salesContext = `
 
 SALES TEAM FOCUS:
 - Help with: product availability, brand info, customer questions, pricing lookups, competitor product comparisons
-- When asked about "best sellers" or "top products": look for products with the most sales orders or mentions
+- 3,525 product S.K.U.s, 131 brands, 270 categories loaded
+- 52,100 sales orders from Dynamics loaded — use these to identify popular products and order patterns
+- When asked about "best sellers" or "top products": report the products and sales orders visible in the search results. Say "based on the data I can see" — don't claim you lack data if results are present.
 - Connect product questions to vendor and procurement data when useful
-- If asked about margins, say "I have product and P.O. cost data — let me check what's available"`;
+- If asked about margins or pricing details not in the results, say "I have product and P.O. data — let me check what's available"`;
 
   const accountingContext = `
 
@@ -465,7 +649,8 @@ ACCOUNTING TEAM FOCUS:
 - Help with: P.O. status, vendor spend analysis, payment tracking, cost breakdowns, order reconciliation
 - When asked about totals or aggregates: cite the data you have and note if it's partial
 - 20,000+ P.O. line items and 3,598 purchase orders are loaded
-- 1,674 vendor records and 492 account records available
+- 837 vendor records and 246 account records available
+- 52,100 sales orders from Dynamics loaded
 - If asked about invoices or payments not in the data, say "that level of detail needs the Dynamics dashboard"`;
 
   const leadershipContext = `
@@ -652,10 +837,13 @@ app.post("/api/voice/stream", async (req, res) => {
 
     console.log(`[meridian-voice/stream] Streaming AI response...`);
 
-    // RAG: query customer knowledge base before LLM call
+    // RAG: query customer knowledge base + KPI dashboard in parallel
     const dept = sessionDepartments.get(sessionId) || "all";
-    const ragContext = await queryCustomerKnowledge(transcript, dept);
-    const systemPrompt = getSystemPrompt(dept) + ragContext;
+    const [ragContext, kpiContext] = await Promise.all([
+      queryCustomerKnowledge(transcript, dept),
+      queryKPIDashboard(transcript),
+    ]);
+    const systemPrompt = getSystemPrompt(dept) + ragContext + kpiContext;
 
     // Stream from Groq LLM
     const stream = await groq.chat.completions.create({
@@ -665,7 +853,7 @@ app.post("/api/voice/stream", async (req, res) => {
         ...history,
         { role: "user", content: transcript },
       ],
-      max_tokens: 150,
+      max_tokens: 300,
       stream: true,
     });
 
@@ -776,8 +964,11 @@ async function speechToText(audioBuffer) {
 
 // ============== Chat: Groq LLM ==============
 async function getAIResponse(userMessage, history, department) {
-  const ragContext = await queryCustomerKnowledge(userMessage, department);
-  const systemPrompt = getSystemPrompt(department) + ragContext;
+  const [ragContext, kpiContext] = await Promise.all([
+    queryCustomerKnowledge(userMessage, department),
+    queryKPIDashboard(userMessage),
+  ]);
+  const systemPrompt = getSystemPrompt(department) + ragContext + kpiContext;
 
   const response = await groq.chat.completions.create({
     model: CHAT_MODEL,
@@ -786,7 +977,7 @@ async function getAIResponse(userMessage, history, department) {
       ...history,
       { role: "user", content: userMessage },
     ],
-    max_tokens: 150,
+    max_tokens: 300,
   });
 
   return response.choices[0].message.content;
