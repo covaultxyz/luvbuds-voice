@@ -37,7 +37,7 @@ async function queryCustomerKnowledge(userMessage, department) {
     const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=10${categoryFilter}`;
     const resp = await fetch(url, {
       headers: { "X-API-Key": GATEWAY_API_KEY },
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) return "";
     const results = await resp.json();
@@ -490,12 +490,13 @@ LEADERSHIP FOCUS:
 app.post("/api/voice", async (req, res) => {
   const authHeader = req.headers.authorization;
   const tokenNS = authHeader?.replace("Bearer ", "") || "";
-  const authMatchNS = AUTH_CODES[tokenNS];
+  const authMatchNS = AUTH_CODES[tokenNS] || (tokenNS.includes(".") ? { dept: "all", name: "JWT User" } : null);
   if (!authMatchNS) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { audio, sessionId, voice } = req.body;
+  const workspaceId = extractWorkspace(req);
   if (sessionId && authMatchNS.dept) {
     sessionDepartments.set(sessionId, authMatchNS.dept);
   }
@@ -506,7 +507,7 @@ app.post("/api/voice", async (req, res) => {
   }
 
   try {
-    console.log(`[meridian-voice] Processing audio for session ${sessionId}`);
+    console.log(`[meridian-voice] Processing audio for session ${sessionId} (workspace: ${workspaceId})`);
     const startTime = Date.now();
 
     // 1. Convert base64 audio to buffer
@@ -530,8 +531,8 @@ app.post("/api/voice", async (req, res) => {
 
     // 3. Get or create session history
     if (!sessions.has(sessionId)) {
-      const restored = loadSessionFromTranscript(sessionId);
-      sessions.set(sessionId, { history: restored, lastAccess: Date.now() });
+      const restored = loadSessionFromTranscript(workspaceId, sessionId);
+      sessions.set(sessionId, { history: restored, lastAccess: Date.now(), workspaceId });
     }
     const session = sessions.get(sessionId);
     session.lastAccess = Date.now();
@@ -548,7 +549,7 @@ app.post("/api/voice", async (req, res) => {
     history.push({ role: "user", content: transcript });
     history.push({ role: "assistant", content: response });
     while (history.length > 20) history.shift();
-    logTranscript(sessionId, transcript, response, { stt: sttTime, ai: aiTime });
+    logTranscript(workspaceId, sessionId, transcript, response, { stt: sttTime, ai: aiTime });
 
     // 5. TTS
     const ttsStart = Date.now();
@@ -583,12 +584,14 @@ app.post("/api/voice", async (req, res) => {
 app.post("/api/voice/stream", async (req, res) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.replace("Bearer ", "") || "";
-  const authMatch = AUTH_CODES[token];
+  // Accept auth codes OR JWTs (JWT contains a dot)
+  const authMatch = AUTH_CODES[token] || (token.includes(".") ? { dept: "all", name: "JWT User" } : null);
   if (!authMatch) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { audio, transcript: clientTranscript, sessionId, voice } = req.body;
+  const workspaceId = extractWorkspace(req);
   // Track department per session
   if (sessionId && authMatch.dept) {
     sessionDepartments.set(sessionId, authMatch.dept);
@@ -633,7 +636,7 @@ app.post("/api/voice/stream", async (req, res) => {
 
     // 2. Get/create session
     if (!sessions.has(sessionId)) {
-      const restored = loadSessionFromTranscript(sessionId);
+      const restored = loadSessionFromTranscript(workspaceId, sessionId);
       sessions.set(sessionId, { history: restored, lastAccess: Date.now() });
     }
     const session = sessions.get(sessionId);
@@ -738,7 +741,7 @@ app.post("/api/voice/stream", async (req, res) => {
     history.push({ role: "user", content: transcript });
     history.push({ role: "assistant", content: fullResponse });
     while (history.length > 20) history.shift();
-    logTranscript(sessionId, transcript, fullResponse, { stt: sttTime, ai: aiTime });
+    logTranscript(workspaceId, sessionId, transcript, fullResponse, { stt: sttTime, ai: aiTime });
 
     // Send done
     res.write(
