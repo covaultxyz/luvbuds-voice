@@ -16,6 +16,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Department-based auth codes
 const AUTH_CODES = {
+  meridian: { dept: "all", name: "Oracle", workspace: "meridian" },
   sales2026: { dept: "sales", name: "Sales" },
   accounting2026: { dept: "accounting", name: "Accounting" },
   leadership2026: { dept: "leadership", name: "Leadership" },
@@ -525,7 +526,7 @@ app.post("/api/auth", (req, res) => {
   const { code } = req.body;
   const match = AUTH_CODES[code];
   if (match) {
-    res.json({ success: true, department: match.dept, departmentName: match.name, workspaceId: "demo" });
+    res.json({ success: true, department: match.dept, departmentName: match.name, workspaceId: match.workspace || "demo" });
   } else {
     res.status(401).json({ success: false, error: "Invalid code" });
   }
