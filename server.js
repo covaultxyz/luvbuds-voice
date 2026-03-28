@@ -155,6 +155,89 @@ async function queryMeridianMIG(userMessage) {
   }
 }
 
+// ============== Meridian MIG Persistence (fire-and-forget) ==============
+
+async function persistToMIG(workspaceId, sessionId, userMessage, aiResponse) {
+  if (!isMeridianWorkspace(workspaceId)) return;
+  if (!KAAS_API_URL || !KAAS_API_KEY) return;
+  const url = `${KAAS_API_URL}/v1/intelligence/remember`;
+  // Fire and forget — don't block the voice response
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': KAAS_API_KEY },
+    body: JSON.stringify({
+      content: `Voice exchange — User: "${userMessage}" | Oracle: "${aiResponse.substring(0, 200)}"`,
+      category: 'observation',
+      importance: 5,
+      workspace_id: workspaceId,
+      source: 'voice-session',
+      session_id: sessionId,
+    }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(e => console.warn('[meridian-voice] MIG persist failed (non-blocking):', e.message));
+}
+
+async function generateSessionSummary(workspaceId, sessionId, history) {
+  if (!isMeridianWorkspace(workspaceId)) return;
+  if (!KAAS_API_URL || !KAAS_API_KEY) return;
+  if (!history || history.length < 4) return; // need at least 2 full exchanges
+
+  try {
+    // Build transcript from history
+    const transcript = history.map(h => `${h.role === 'user' ? 'User' : 'Oracle'}: ${h.content}`).join('\n');
+    const summaryPrompt = `Summarize this voice conversation in 2-3 sentences. Extract key entities (names, companies, metrics, products mentioned). Return JSON only, no markdown: {"summary": "...", "entities": [{"name": "...", "type": "..."}]}
+
+Conversation:
+${transcript}`;
+
+    // Use Groq to generate summary
+    const completion = await groq.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [{ role: 'user', content: summaryPrompt }],
+      max_tokens: 300,
+      temperature: 0.3,
+    });
+
+    const raw = completion.choices[0]?.message?.content || '';
+    let summary, entities;
+    try {
+      // Strip markdown code fences if present
+      const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      summary = parsed.summary || raw;
+      entities = Array.isArray(parsed.entities) ? parsed.entities : [];
+    } catch {
+      // LLM didn't return valid JSON — use raw text as summary
+      summary = raw.substring(0, 300);
+      entities = [];
+    }
+
+    // POST session summary to KaaS
+    const url = `${KAAS_API_URL}/v1/intelligence/session-summary`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': KAAS_API_KEY },
+      body: JSON.stringify({
+        summary,
+        entities,
+        workspace_id: workspaceId,
+        session_id: sessionId,
+        exchange_count: Math.floor(history.length / 2),
+        source: 'voice-session',
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (resp.ok) {
+      console.log(`[meridian-voice] Session summary persisted for ${sessionId} (${Math.floor(history.length / 2)} exchanges, ${entities.length} entities)`);
+    } else {
+      console.warn(`[meridian-voice] Session summary API returned ${resp.status} for ${sessionId}`);
+    }
+  } catch (e) {
+    console.warn(`[meridian-voice] Session summary failed (non-blocking): ${e.message}`);
+  }
+}
+
 // ============== Customer Knowledge Retrieval (RAG) ==============
 
 // Stats cache: fetched once per 10 minutes, gives the LLM awareness of available data
@@ -868,6 +951,7 @@ app.post("/api/voice", async (req, res) => {
     history.push({ role: "assistant", content: response });
     while (history.length > 20) history.shift();
     logTranscript(workspaceId, sessionId, transcript, response, { stt: sttTime, ai: aiTime });
+    persistToMIG(workspaceId, sessionId, transcript, response);
 
     // 5. TTS
     const ttsStart = Date.now();
@@ -955,10 +1039,11 @@ app.post("/api/voice/stream", async (req, res) => {
     // 2. Get/create session
     if (!sessions.has(sessionId)) {
       const restored = loadSessionFromTranscript(workspaceId, sessionId);
-      sessions.set(sessionId, { history: restored, lastAccess: Date.now() });
+      sessions.set(sessionId, { history: restored, lastAccess: Date.now(), workspaceId });
     }
     const session = sessions.get(sessionId);
     session.lastAccess = Date.now();
+    session.workspaceId = session.workspaceId || workspaceId;
     const history = session.history;
 
     // 3. Stream AI response and start TTS on sentences
@@ -1071,6 +1156,7 @@ app.post("/api/voice/stream", async (req, res) => {
     history.push({ role: "assistant", content: fullResponse });
     while (history.length > 20) history.shift();
     logTranscript(workspaceId, sessionId, transcript, fullResponse, { stt: sttTime, ai: aiTime });
+    persistToMIG(workspaceId, sessionId, transcript, fullResponse);
 
     // Send done
     res.write(
@@ -1278,12 +1364,36 @@ function extractSentences(text) {
   return { sentences, remaining: lastPart };
 }
 
-// ============== Session Cleanup ==============
+// ============== Session End + Cleanup ==============
+
+// Explicitly end a session (called from end-call button)
+app.post("/api/session/end", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+  const session = sessions.get(sessionId);
+  if (!session) return res.json({ ok: true, summary: false });
+
+  const workspaceId = session.workspaceId || extractWorkspace(req);
+  // Fire summary generation in the background — don't block the response
+  generateSessionSummary(workspaceId, sessionId, session.history)
+    .catch(e => console.warn(`[meridian-voice] End-call summary failed: ${e.message}`));
+
+  sessions.delete(sessionId);
+  console.log(`[meridian-voice] Session ended by client: ${sessionId}`);
+  res.json({ ok: true, summary: isMeridianWorkspace(workspaceId) });
+});
+
+// Periodic cleanup — also generates summaries for timed-out Meridian sessions
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions.entries()) {
     if (session.lastAccess && now - session.lastAccess > 30 * 60 * 1000) {
       console.log(`[meridian-voice] Clearing stale session: ${id}`);
+      const workspaceId = session.workspaceId || "demo";
+      // Generate summary for Meridian sessions before eviction (fire-and-forget)
+      generateSessionSummary(workspaceId, id, session.history)
+        .catch(e => console.warn(`[meridian-voice] Stale session summary failed: ${e.message}`));
       sessions.delete(id);
     }
   }
