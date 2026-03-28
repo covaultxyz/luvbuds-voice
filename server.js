@@ -16,11 +16,12 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Department-based auth codes
 const AUTH_CODES = {
-  meridian: { dept: "all", name: "Oracle", workspace: "meridian" },
   sales2026: { dept: "sales", name: "Sales" },
   accounting2026: { dept: "accounting", name: "Accounting" },
   leadership2026: { dept: "leadership", name: "Leadership" },
   [process.env.AUTH_CODE || "luvbuds2026"]: { dept: "all", name: "General" },
+  // Must be AFTER computed AUTH_CODE property — if AUTH_CODE=meridian, this overrides it
+  meridian: { dept: "all", name: "Oracle", workspace: "meridian" },
 };
 const AUTH_CODE = process.env.AUTH_CODE || "luvbuds2026"; // legacy compat
 const GATEWAY_URL = process.env.GATEWAY_URL || "";
@@ -53,6 +54,105 @@ function getMeridianPrompt() {
 - You are Oracle, the Meridian AI voice agent. You ARE the product demo.
 
 ${MERIDIAN_HOUSE_PROMPT}`;
+}
+
+// ============== Meridian MIG Context Retrieval (via KaaS relay) ==============
+
+const KAAS_API_URL = process.env.KAAS_API_URL || "https://meridian.covault.xyz";
+const KAAS_API_KEY = process.env.KAAS_API_KEY || "";
+
+// Domain knowledge cache: refreshed every 10 minutes
+let migDomainCache = null;
+let migDomainCacheTime = 0;
+const MIG_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+async function fetchMeridianDomainKnowledge(domain = "business_operations") {
+  if (migDomainCache && Date.now() - migDomainCacheTime < MIG_CACHE_TTL) return migDomainCache;
+  if (!KAAS_API_URL) return null;
+  try {
+    const headers = {};
+    if (KAAS_API_KEY) headers["X-API-Key"] = KAAS_API_KEY;
+    const resp = await fetch(
+      `${KAAS_API_URL}/v1/cortex/${encodeURIComponent(domain)}?importance_min=6&limit=15`,
+      { headers, signal: AbortSignal.timeout(5000) }
+    );
+    if (!resp.ok) {
+      console.warn(`[meridian-voice] MIG cortex fetch failed: ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    migDomainCache = data;
+    migDomainCacheTime = Date.now();
+    return data;
+  } catch (e) {
+    console.warn(`[meridian-voice] MIG domain knowledge fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function searchMeridianKnowledge(query, limit = 8) {
+  if (!KAAS_API_URL || !query) return [];
+  try {
+    const headers = {};
+    if (KAAS_API_KEY) headers["X-API-Key"] = KAAS_API_KEY;
+    const q = encodeURIComponent(query.slice(0, 200));
+    const resp = await fetch(
+      `${KAAS_API_URL}/v1/search?q=${q}&limit=${limit}`,
+      { headers, signal: AbortSignal.timeout(5000) }
+    );
+    if (!resp.ok) return [];
+    return await resp.json();
+  } catch (e) {
+    console.warn(`[meridian-voice] MIG search failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function queryMeridianMIG(userMessage) {
+  if (!KAAS_API_URL) return "";
+
+  try {
+    // Run domain knowledge fetch (cached) + live search in parallel
+    const [domainData, searchResults] = await Promise.all([
+      fetchMeridianDomainKnowledge("business_operations"),
+      searchMeridianKnowledge(userMessage, 8),
+    ]);
+
+    const parts = [];
+
+    // Format domain knowledge (high-importance memories about the business)
+    if (domainData && domainData.findings && domainData.findings.length > 0) {
+      const findings = domainData.findings
+        .slice(0, 10)
+        .map((f) => `- ${f.content.slice(0, 250)}`)
+        .join("\n");
+      parts.push(`MERIDIAN KNOWLEDGE BASE:\n${findings}`);
+    }
+
+    // Format search results (research documents matching the question)
+    if (Array.isArray(searchResults) && searchResults.length > 0) {
+      const docs = searchResults
+        .slice(0, 6)
+        .map((r) => {
+          let line = r.title || "untitled";
+          if (r.excerpt && r.excerpt.length > 5) line += ` — ${r.excerpt.slice(0, 200)}`;
+          return `- ${line}`;
+        })
+        .join("\n");
+      parts.push(`RELEVANT RESEARCH:\n${docs}`);
+    }
+
+    if (parts.length === 0) return "";
+
+    const context = parts.join("\n\n");
+    console.log(
+      `[meridian-voice] MIG context: ${domainData?.findings?.length || 0} domain findings, ${searchResults?.length || 0} search results for "${userMessage.slice(0, 40)}..."`
+    );
+    return `\n${context}\n`;
+  } catch (e) {
+    console.warn(`[meridian-voice] MIG context query failed: ${e.message}`);
+    return "";
+  }
 }
 
 // ============== Customer Knowledge Retrieval (RAG) ==============
@@ -754,7 +854,11 @@ app.post("/api/voice", async (req, res) => {
     // 4. Get AI response from Groq LLM
     const aiStart = Date.now();
     const deptNonStream = sessionDepartments.get(sessionId) || "all";
-    const overridePrompt = isMeridianWorkspace(workspaceId) ? getMeridianPrompt() : null;
+    let overridePrompt = null;
+    if (isMeridianWorkspace(workspaceId)) {
+      const migContext = await queryMeridianMIG(transcript);
+      overridePrompt = getMeridianPrompt() + migContext;
+    }
     const response = await getAIResponse(transcript, history, deptNonStream, overridePrompt);
     const aiTime = Date.now() - aiStart;
     console.log(`[meridian-voice] AI (${aiTime}ms): "${response}"`);
@@ -870,9 +974,10 @@ app.post("/api/voice/stream", async (req, res) => {
     const dept = sessionDepartments.get(sessionId) || "all";
     let systemPrompt;
     if (isMeridianWorkspace(workspaceId)) {
-      // Meridian house workspace — Oracle identity, no LuvBuds RAG
-      systemPrompt = getMeridianPrompt();
-      console.log(`[meridian-voice/stream] Meridian house prompt for workspace ${workspaceId}`);
+      // Meridian house workspace — Oracle identity + MIG knowledge via KaaS relay
+      const migContext = await queryMeridianMIG(transcript);
+      systemPrompt = getMeridianPrompt() + migContext;
+      console.log(`[meridian-voice/stream] Meridian house prompt + MIG context for workspace ${workspaceId}`);
     } else {
       const [ragContext, kpiContext] = await Promise.all([
         queryCustomerKnowledge(transcript, dept),
