@@ -27,6 +27,33 @@ const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "";
 const KPI_DASHBOARD_URL = process.env.KPI_DASHBOARD_URL || "https://kpi-dashboard-8fj4.onrender.com";
 const KPI_DASHBOARD_AUTH = process.env.KPI_DASHBOARD_AUTH || "";  // "admin:password" format
 
+// ============== Meridian House Prompt (workspace-aware) ==============
+let MERIDIAN_HOUSE_PROMPT = "";
+try {
+  const housePath = path.resolve(__dirname, "config/agentvox/meridian-house-voice.md");
+  if (fs.existsSync(housePath)) {
+    MERIDIAN_HOUSE_PROMPT = fs.readFileSync(housePath, "utf-8");
+    console.log(`[meridian-voice] Loaded Meridian house prompt (${MERIDIAN_HOUSE_PROMPT.length} chars)`);
+  }
+} catch (e) {
+  console.warn(`[meridian-voice] Failed to load Meridian house prompt: ${e.message}`);
+}
+const MERIDIAN_WORKSPACES = new Set(["meridian", "meridian-house", "meridian-demo"]);
+
+function isMeridianWorkspace(workspaceId) {
+  return MERIDIAN_HOUSE_PROMPT && MERIDIAN_WORKSPACES.has(workspaceId);
+}
+
+function getMeridianPrompt() {
+  return `CRITICAL VOICE RULES — you are on a LIVE VOICE CALL, not writing text:
+- Keep responses to 1-3 sentences MAX. You are speaking, not writing an essay.
+- NEVER use markdown formatting (no **, no ##, no bullet lists).
+- Speak naturally. Use contractions. Sound like a real human on a phone call.
+- You are Oracle, the Meridian AI voice agent. You ARE the product demo.
+
+${MERIDIAN_HOUSE_PROMPT}`;
+}
+
 // ============== Customer Knowledge Retrieval (RAG) ==============
 
 // Stats cache: fetched once per 10 minutes, gives the LLM awareness of available data
@@ -726,7 +753,8 @@ app.post("/api/voice", async (req, res) => {
     // 4. Get AI response from Groq LLM
     const aiStart = Date.now();
     const deptNonStream = sessionDepartments.get(sessionId) || "all";
-    const response = await getAIResponse(transcript, history, deptNonStream);
+    const overridePrompt = isMeridianWorkspace(workspaceId) ? getMeridianPrompt() : null;
+    const response = await getAIResponse(transcript, history, deptNonStream, overridePrompt);
     const aiTime = Date.now() - aiStart;
     console.log(`[meridian-voice] AI (${aiTime}ms): "${response}"`);
 
@@ -839,11 +867,18 @@ app.post("/api/voice/stream", async (req, res) => {
 
     // RAG: query customer knowledge base + KPI dashboard in parallel
     const dept = sessionDepartments.get(sessionId) || "all";
-    const [ragContext, kpiContext] = await Promise.all([
-      queryCustomerKnowledge(transcript, dept),
-      queryKPIDashboard(transcript),
-    ]);
-    const systemPrompt = getSystemPrompt(dept) + ragContext + kpiContext;
+    let systemPrompt;
+    if (isMeridianWorkspace(workspaceId)) {
+      // Meridian house workspace — Oracle identity, no LuvBuds RAG
+      systemPrompt = getMeridianPrompt();
+      console.log(`[meridian-voice/stream] Meridian house prompt for workspace ${workspaceId}`);
+    } else {
+      const [ragContext, kpiContext] = await Promise.all([
+        queryCustomerKnowledge(transcript, dept),
+        queryKPIDashboard(transcript),
+      ]);
+      systemPrompt = getSystemPrompt(dept) + ragContext + kpiContext;
+    }
 
     // Stream from Groq LLM
     const stream = await groq.chat.completions.create({
@@ -963,12 +998,17 @@ async function speechToText(audioBuffer) {
 }
 
 // ============== Chat: Groq LLM ==============
-async function getAIResponse(userMessage, history, department) {
-  const [ragContext, kpiContext] = await Promise.all([
-    queryCustomerKnowledge(userMessage, department),
-    queryKPIDashboard(userMessage),
-  ]);
-  const systemPrompt = getSystemPrompt(department) + ragContext + kpiContext;
+async function getAIResponse(userMessage, history, department, overridePrompt = null) {
+  let systemPrompt;
+  if (overridePrompt) {
+    systemPrompt = overridePrompt;
+  } else {
+    const [ragContext, kpiContext] = await Promise.all([
+      queryCustomerKnowledge(userMessage, department),
+      queryKPIDashboard(userMessage),
+    ]);
+    systemPrompt = getSystemPrompt(department) + ragContext + kpiContext;
+  }
 
   const response = await groq.chat.completions.create({
     model: CHAT_MODEL,
