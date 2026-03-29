@@ -113,14 +113,49 @@ async function searchMeridianKnowledge(query, limit = 8) {
   }
 }
 
-async function queryMeridianMIG(userMessage) {
+// ============== Contact Memory Recall ==============
+// Fetch prior conversations from the same caller to provide continuity
+async function recallContactMemory(contactId, limit = 5) {
+  if (!KAAS_API_URL || !contactId) return [];
+  try {
+    const headers = {};
+    if (KAAS_API_KEY) headers["X-API-Key"] = KAAS_API_KEY;
+    const q = encodeURIComponent("contact:" + contactId);
+    const resp = await fetch(
+      `${KAAS_API_URL}/v1/intelligence/recall?workspace_id=meridian&q=${q}&limit=${limit}`,
+      { headers, signal: AbortSignal.timeout(5000) }
+    );
+    if (!resp.ok) return [];
+    return await resp.json();
+  } catch (e) {
+    console.warn(`[meridian-voice] Contact recall failed: ${e.message}`);
+    return [];
+  }
+}
+
+// Extract a stable contact identifier from the auth token
+function extractContactId(authToken) {
+  if (!authToken) return null;
+  // JWT — extract sub or workspace_id as contact identifier
+  if (authToken.includes(".")) {
+    try {
+      const payload = JSON.parse(Buffer.from(authToken.split(".")[1], "base64").toString());
+      return payload.sub || payload.workspace_id || null;
+    } catch { return null; }
+  }
+  // Auth code — use the code itself as the contact identifier
+  return authToken;
+}
+
+async function queryMeridianMIG(userMessage, contactId = null) {
   if (!KAAS_API_URL) return "";
 
   try {
-    // Run domain knowledge fetch (cached) + live search in parallel
-    const [domainData, searchResults] = await Promise.all([
+    // Run domain knowledge fetch (cached) + live search + contact recall in parallel
+    const [domainData, searchResults, contactHistory] = await Promise.all([
       fetchMeridianDomainKnowledge("business_operations"),
       searchMeridianKnowledge(userMessage, 8),
+      contactId ? recallContactMemory(contactId, 5) : Promise.resolve([]),
     ]);
 
     const parts = [];
@@ -147,11 +182,20 @@ async function queryMeridianMIG(userMessage) {
       parts.push(`RELEVANT RESEARCH:\n${docs}`);
     }
 
+    // Format contact history (prior conversations from the same caller)
+    if (Array.isArray(contactHistory) && contactHistory.length > 0) {
+      const priorExchanges = contactHistory
+        .slice(0, 5)
+        .map((r) => `- ${(r.content || r.text || "").slice(0, 250)}`)
+        .join("\n");
+      parts.push(`PRIOR CONVERSATIONS WITH THIS CALLER:\n${priorExchanges}`);
+    }
+
     if (parts.length === 0) return "";
 
     const context = parts.join("\n\n");
     console.log(
-      `[meridian-voice] MIG context: ${domainData?.findings?.length || 0} domain findings, ${searchResults?.length || 0} search results for "${userMessage.slice(0, 40)}..."`
+      `[meridian-voice] MIG context: ${domainData?.findings?.length || 0} domain, ${searchResults?.length || 0} search, ${contactHistory?.length || 0} contact for "${userMessage.slice(0, 40)}..."`
     );
     return `\n${context}\n`;
   } catch (e) {
@@ -162,7 +206,7 @@ async function queryMeridianMIG(userMessage) {
 
 // ============== Meridian MIG Persistence (fire-and-forget) ==============
 
-async function persistToMIG(workspaceId, sessionId, userMessage, aiResponse) {
+async function persistToMIG(workspaceId, sessionId, userMessage, aiResponse, contactId = null) {
   if (!isMeridianWorkspace(workspaceId)) return;
   if (!KAAS_API_URL || !KAAS_API_KEY) return;
   const url = `${KAAS_API_URL}/v1/intelligence/remember`;
@@ -171,7 +215,7 @@ async function persistToMIG(workspaceId, sessionId, userMessage, aiResponse) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-API-Key': KAAS_API_KEY },
     body: JSON.stringify({
-      content: `Voice exchange — User: "${userMessage}" | Oracle: "${aiResponse.substring(0, 200)}"`,
+      content: `Voice exchange${contactId ? " [contact:" + contactId + "]" : ""} — User: "${userMessage}" | Oracle: "${aiResponse.substring(0, 200)}"`,
       category: 'observation',
       importance: 5,
       workspace_id: workspaceId,
@@ -768,6 +812,22 @@ app.post("/api/auth/register", async (req, res) => {
       }
     }
 
+    // Notify MERIDIAN mesh about the signup (non-blocking, fire-and-forget)
+    if (KAAS_API_URL && KAAS_API_KEY) {
+      fetch(`${KAAS_API_URL}/v1/intelligence/remember`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": KAAS_API_KEY },
+        body: JSON.stringify({
+          content: `NEW CUSTOMER SIGNUP: ${email} (${companyName || "unknown"}) — registered for AgentVox. Workspace: ${data.workspaceId || data.workspace_id || "pending"}`,
+          category: "observation",
+          importance: 8,
+          workspace_id: "meridian-core",
+          source: "voice-signup",
+        }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => {});
+    }
+
     const responsePayload = {
       token: data.token,
       user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: companyName || "" },
@@ -934,6 +994,7 @@ app.post("/api/voice", async (req, res) => {
 
   const { audio, sessionId, voice } = req.body;
   const workspaceId = extractWorkspace(req);
+  const contactId = extractContactId(tokenNS);
   if (sessionId && authMatchNS.dept) {
     sessionDepartments.set(sessionId, authMatchNS.dept);
   }
@@ -984,7 +1045,7 @@ app.post("/api/voice", async (req, res) => {
     const deptNonStream = sessionDepartments.get(sessionId) || "all";
     let overridePrompt = null;
     if (isMeridianWorkspace(workspaceId)) {
-      const migContext = await queryMeridianMIG(transcript);
+      const migContext = await queryMeridianMIG(transcript, contactId);
       overridePrompt = getMeridianPrompt() + migContext;
     }
     const response = await getAIResponse(transcript, history, deptNonStream, overridePrompt, sessionGatewayKeys.get(sessionId) || "");
@@ -996,7 +1057,7 @@ app.post("/api/voice", async (req, res) => {
     history.push({ role: "assistant", content: response });
     while (history.length > 20) history.shift();
     logTranscript(workspaceId, sessionId, transcript, response, { stt: sttTime, ai: aiTime });
-    persistToMIG(workspaceId, sessionId, transcript, response);
+    persistToMIG(workspaceId, sessionId, transcript, response, contactId);
 
     // 5. TTS
     const ttsStart = Date.now();
@@ -1042,6 +1103,7 @@ app.post("/api/voice/stream", async (req, res) => {
 
   const { audio, transcript: clientTranscript, sessionId, voice } = req.body;
   const workspaceId = extractWorkspace(req);
+  const contactId = extractContactId(token);
   // Track department + gateway key per session
   if (sessionId && authMatch.dept) {
     sessionDepartments.set(sessionId, authMatch.dept);
@@ -1111,9 +1173,9 @@ app.post("/api/voice/stream", async (req, res) => {
     let systemPrompt;
     if (isMeridianWorkspace(workspaceId)) {
       // Meridian house workspace — Oracle identity + MIG knowledge via KaaS relay
-      const migContext = await queryMeridianMIG(transcript);
+      const migContext = await queryMeridianMIG(transcript, contactId);
       systemPrompt = getMeridianPrompt() + migContext;
-      console.log(`[meridian-voice/stream] Meridian house prompt + MIG context for workspace ${workspaceId}`);
+      console.log(`[meridian-voice/stream] Meridian house prompt + MIG context for workspace ${workspaceId}${contactId ? " (contact: " + contactId + ")" : ""}`);
     } else {
       const [ragContext, kpiContext] = await Promise.all([
         queryCustomerKnowledge(transcript, dept, sessionGatewayKeys.get(sessionId) || ""),
@@ -1211,7 +1273,7 @@ app.post("/api/voice/stream", async (req, res) => {
     history.push({ role: "assistant", content: fullResponse });
     while (history.length > 20) history.shift();
     logTranscript(workspaceId, sessionId, transcript, fullResponse, { stt: sttTime, ai: aiTime });
-    persistToMIG(workspaceId, sessionId, transcript, fullResponse);
+    persistToMIG(workspaceId, sessionId, transcript, fullResponse, contactId);
 
     // Send done
     res.write(
