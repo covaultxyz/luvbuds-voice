@@ -740,10 +740,40 @@ app.post("/api/auth/register", async (req, res) => {
     if (!resp.ok) return res.status(resp.status).json(data);
     console.log(`[meridian-voice] Registered: ${email} → workspace ${data.workspaceId || data.workspace_id}`);
     console.log(`[meridian-voice] NEW SIGNUP: ${email} (${companyName || "no company"})`);
-    res.json({
+
+    // After successful registration, create a gateway API key for KaaS access
+    let gatewayApiKey = null;
+    if (KAAS_API_URL && KAAS_API_KEY) {
+      try {
+        const keyResp = await fetch(`${KAAS_API_URL}/v1/onboard`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-API-Key": KAAS_API_KEY },
+          body: JSON.stringify({
+            name: companyName || email.split("@")[0],
+            email: email,
+            tier: "explorer",
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (keyResp.ok) {
+          const keyData = await keyResp.json();
+          gatewayApiKey = keyData.api_key;
+          console.log(`[meridian-voice] Gateway key created for ${email}: ${gatewayApiKey?.substring(0, 12)}...`);
+        } else {
+          const errBody = await keyResp.text().catch(() => "");
+          console.warn(`[meridian-voice] Gateway onboard returned ${keyResp.status}: ${errBody}`);
+        }
+      } catch (e) {
+        console.warn(`[meridian-voice] Gateway key creation failed (non-blocking): ${e.message}`);
+      }
+    }
+
+    const responsePayload = {
       token: data.token,
       user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: companyName || "" },
-    });
+    };
+    if (gatewayApiKey) responsePayload.gateway_api_key = gatewayApiKey;
+    res.json(responsePayload);
   } catch (e) {
     res.status(502).json({ error: "Registration service unavailable" });
   }
