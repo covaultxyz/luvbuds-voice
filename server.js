@@ -4,8 +4,10 @@ import { OpenAI, toFile } from "openai";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { EdgeTTS } from "node-edge-tts";
+import Database from "better-sqlite3";
 import { initBridge, recordExchange, recordLead, cleanupSessions } from "./agentvox-bridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -753,7 +755,63 @@ setTimeout(async () => {
   }
 }, 2000);
 
-// ============== Auth ==============
+// ============== Local Auth Store (SQLite + HMAC JWT) ==============
+// Replaces the proxy to voice/app.py — registration and login handled directly.
+// NOTE: On Render (no persistent disk), auth.db resets on each deploy.
+// For production persistence, attach a Render disk or migrate to Render Postgres.
+const AUTH_DB_PATH = path.join(__dirname, "auth.db");
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production";
+const JWT_EXPIRY_DAYS = 7;
+
+const authDb = new Database(AUTH_DB_PATH);
+authDb.pragma("journal_mode = WAL");
+authDb.pragma("busy_timeout = 5000");
+
+// Create users table if it doesn't exist
+authDb.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT DEFAULT '',
+    workspace_id TEXT NOT NULL,
+    role TEXT DEFAULT 'owner',
+    created_at TEXT DEFAULT (datetime('now'))
+  )
+`);
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHmac("sha256", salt).update(password).digest("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  const check = crypto.createHmac("sha256", salt).update(password).digest("hex");
+  return check === hash;
+}
+
+function createJwt(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
+  return `${header}.${body}.${signature}`;
+}
+
+function createToken(userId, workspaceId, email) {
+  const now = Math.floor(Date.now() / 1000);
+  return createJwt({
+    sub: userId,
+    workspace_id: workspaceId,
+    email,
+    iat: now,
+    exp: now + JWT_EXPIRY_DAYS * 86400,
+  });
+}
+
+console.log(`[meridian-voice] Auth store: ${AUTH_DB_PATH}`);
+
 const VOICE_API_URL = process.env.VOICE_API_URL || "http://127.0.0.1:8100";
 
 // Legacy code-based auth — now with per-customer gateway key
@@ -769,20 +827,28 @@ app.post("/api/auth", (req, res) => {
   }
 });
 
-// JWT registration — proxies to voice API
+// JWT registration — handled locally (no voice API proxy needed)
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { email, password, companyName } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-    const resp = await fetch(`${VOICE_API_URL}/api/v1/auth/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password, name: companyName || email.split("@")[0] }),
-      signal: AbortSignal.timeout(10000),
-    });
-    const data = await resp.json();
-    if (!resp.ok) return res.status(resp.status).json(data);
-    console.log(`[meridian-voice] Registered: ${email} → workspace ${data.workspaceId || data.workspace_id}`);
+
+    // Check if email already exists
+    const existing = authDb.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    if (existing) return res.status(409).json({ detail: "Email already registered" });
+
+    // Create user + workspace locally
+    const userId = crypto.randomUUID();
+    const workspaceId = crypto.randomUUID();
+    const name = companyName || email.split("@")[0];
+
+    authDb.prepare(
+      "INSERT INTO users (id, email, password_hash, name, workspace_id, role) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(userId, email, hashPassword(password), name, workspaceId, "owner");
+
+    const token = createToken(userId, workspaceId, email);
+
+    console.log(`[meridian-voice] Registered: ${email} → workspace ${workspaceId}`);
     console.log(`[meridian-voice] NEW SIGNUP: ${email} (${companyName || "no company"})`);
 
     // After successful registration, create a gateway API key for KaaS access
@@ -818,7 +884,7 @@ app.post("/api/auth/register", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-API-Key": KAAS_API_KEY },
         body: JSON.stringify({
-          content: `NEW CUSTOMER SIGNUP: ${email} (${companyName || "unknown"}) — registered for AgentVox. Workspace: ${data.workspaceId || data.workspace_id || "pending"}`,
+          content: `NEW CUSTOMER SIGNUP: ${email} (${companyName || "unknown"}) — registered for AgentVox. Workspace: ${workspaceId}`,
           category: "observation",
           importance: 8,
           workspace_id: "meridian-core",
@@ -829,35 +895,41 @@ app.post("/api/auth/register", async (req, res) => {
     }
 
     const responsePayload = {
-      token: data.token,
-      user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: companyName || "" },
+      token,
+      user: { id: userId, email, workspaceId, companyName: companyName || "" },
     };
     if (gatewayApiKey) responsePayload.gateway_api_key = gatewayApiKey;
     res.json(responsePayload);
   } catch (e) {
-    res.status(502).json({ error: "Registration service unavailable" });
+    console.error(`[meridian-voice] Registration error: ${e.message}`);
+    if (e.message?.includes("UNIQUE constraint")) {
+      return res.status(409).json({ detail: "Email already registered" });
+    }
+    res.status(500).json({ error: "Registration failed" });
   }
 });
 
-// JWT login — proxies to voice API
+// JWT login — handled locally (no voice API proxy needed)
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-    const resp = await fetch(`${VOICE_API_URL}/api/v1/auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-      signal: AbortSignal.timeout(10000),
-    });
-    const data = await resp.json();
-    if (!resp.ok) return res.status(resp.status).json(data);
+
+    const user = authDb.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ detail: "Invalid email or password" });
+    }
+
+    const token = createToken(user.id, user.workspace_id, email);
+    console.log(`[meridian-voice] Login: ${email}`);
+
     res.json({
-      token: data.token,
-      user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: data.displayName || "" },
+      token,
+      user: { id: user.id, email, workspaceId: user.workspace_id, companyName: user.name || "" },
     });
   } catch (e) {
-    res.status(502).json({ error: "Login service unavailable" });
+    console.error(`[meridian-voice] Login error: ${e.message}`);
+    res.status(500).json({ error: "Login failed" });
   }
 });
 
