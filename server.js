@@ -14,18 +14,23 @@ const PORT = process.env.PORT || 8300;
 // Config from environment
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-// Department-based auth codes
+// Department-based auth codes — each can have a per-customer gateway key
+const KAAS_API_URL = process.env.KAAS_API_URL || "https://meridian.covault.xyz";
+const KAAS_API_KEY = process.env.KAAS_API_KEY || "";
 const AUTH_CODES = {
   sales2026: { dept: "sales", name: "Sales" },
   accounting2026: { dept: "accounting", name: "Accounting" },
   leadership2026: { dept: "leadership", name: "Leadership" },
   [process.env.AUTH_CODE || "luvbuds2026"]: { dept: "all", name: "General" },
   // Must be AFTER computed AUTH_CODE property — if AUTH_CODE=meridian, this overrides it
-  meridian: { dept: "all", name: "Oracle", workspace: "meridian" },
+  meridian: { dept: "all", name: "Oracle", workspace: "meridian", gatewayKey: KAAS_API_KEY },
 };
 const AUTH_CODE = process.env.AUTH_CODE || "luvbuds2026"; // legacy compat
 const GATEWAY_URL = process.env.GATEWAY_URL || "";
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "";
+
+// Per-session gateway keys (for per-customer rate limiting on the gateway)
+const sessionGatewayKeys = new Map(); // sessionId → gatewayKey
 const KPI_DASHBOARD_URL = process.env.KPI_DASHBOARD_URL || "https://kpi-dashboard-8fj4.onrender.com";
 const KPI_DASHBOARD_AUTH = process.env.KPI_DASHBOARD_AUTH || "";  // "admin:password" format
 
@@ -57,9 +62,7 @@ ${MERIDIAN_HOUSE_PROMPT}`;
 }
 
 // ============== Meridian MIG Context Retrieval (via KaaS relay) ==============
-
-const KAAS_API_URL = process.env.KAAS_API_URL || "https://meridian.covault.xyz";
-const KAAS_API_KEY = process.env.KAAS_API_KEY || "";
+// KAAS_API_URL and KAAS_API_KEY defined at top of file (line 18-19)
 
 // Domain knowledge cache: refreshed every 10 minutes
 let migDomainCache = null;
@@ -245,12 +248,13 @@ let statsCache = null;
 let statsCacheTime = 0;
 const STATS_TTL = 10 * 60 * 1000; // 10 minutes
 
-async function fetchStats() {
+async function fetchStats(apiKey = "") {
   if (statsCache && Date.now() - statsCacheTime < STATS_TTL) return statsCache;
-  if (!GATEWAY_URL || !GATEWAY_API_KEY) return null;
+  const key = apiKey || GATEWAY_API_KEY;
+  if (!GATEWAY_URL || !key) return null;
   try {
     const resp = await fetch(`${GATEWAY_URL}/v1/customer/stats`, {
-      headers: { "X-API-Key": GATEWAY_API_KEY },
+      headers: { "X-API-Key": key },
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) return null;
@@ -289,29 +293,31 @@ const DEPT_CATEGORIES = {
   all: ["products", "dynamics_sales_orders", "dynamics_purchase_orders", "dynamics_vendors"],
 };
 
-async function searchGateway(query, limit = 10, category = "") {
+async function searchGateway(query, limit = 10, category = "", apiKey = "") {
   const q = encodeURIComponent(query.slice(0, 200));
   const catParam = category ? `&category=${category}` : "";
+  const key = apiKey || GATEWAY_API_KEY;
   const url = `${GATEWAY_URL}/v1/customer/search?q=${q}&limit=${limit}${catParam}`;
   const resp = await fetch(url, {
-    headers: { "X-API-Key": GATEWAY_API_KEY },
+    headers: { "X-API-Key": key },
     signal: AbortSignal.timeout(8000),
   });
   if (!resp.ok) return [];
   return resp.json();
 }
 
-async function queryCustomerKnowledge(userMessage, department) {
-  if (!GATEWAY_URL || !GATEWAY_API_KEY) return "";
+async function queryCustomerKnowledge(userMessage, department, apiKey = "") {
+  const key = apiKey || GATEWAY_API_KEY;
+  if (!GATEWAY_URL || !key) return "";
   try {
     // Prefetch stats (cached, non-blocking after first call)
-    const statsPromise = fetchStats();
+    const statsPromise = fetchStats(key);
 
     const analytical = isAnalyticalQuery(userMessage);
     const searches = [];
 
     // Primary search: full query, no category filter, broad results
-    searches.push(searchGateway(userMessage, analytical ? 15 : 10));
+    searches.push(searchGateway(userMessage, analytical ? 15 : 10, "", key));
 
     // For analytical questions: add targeted category sub-searches
     if (analytical) {
@@ -323,7 +329,7 @@ async function queryCustomerKnowledge(userMessage, department) {
       if (keyTerms.length > 2) {
         // Search top 2 most relevant categories with focused terms
         for (const cat of deptCats.slice(0, 2)) {
-          searches.push(searchGateway(keyTerms, 5, cat));
+          searches.push(searchGateway(keyTerms, 5, cat, key));
         }
       }
     }
@@ -704,12 +710,14 @@ setTimeout(async () => {
 // ============== Auth ==============
 const VOICE_API_URL = process.env.VOICE_API_URL || "http://127.0.0.1:8100";
 
-// Legacy code-based auth
+// Legacy code-based auth — now with per-customer gateway key
 app.post("/api/auth", (req, res) => {
   const { code } = req.body;
   const match = AUTH_CODES[code];
   if (match) {
-    res.json({ success: true, department: match.dept, departmentName: match.name, workspaceId: match.workspace || "demo" });
+    // Return gateway key indicator (not the key itself — that stays server-side)
+    const hasGatewayKey = !!(match.gatewayKey || GATEWAY_API_KEY);
+    res.json({ success: true, department: match.dept, departmentName: match.name, workspaceId: match.workspace || "demo", gatewayEnabled: hasGatewayKey });
   } else {
     res.status(401).json({ success: false, error: "Invalid code" });
   }
@@ -896,6 +904,10 @@ app.post("/api/voice", async (req, res) => {
   if (sessionId && authMatchNS.dept) {
     sessionDepartments.set(sessionId, authMatchNS.dept);
   }
+  // Store per-session gateway key for per-customer rate limiting
+  if (sessionId && !sessionGatewayKeys.has(sessionId)) {
+    sessionGatewayKeys.set(sessionId, authMatchNS.gatewayKey || GATEWAY_API_KEY);
+  }
   const selectedVoice = voice || "nova";
 
   if (!audio) {
@@ -942,7 +954,7 @@ app.post("/api/voice", async (req, res) => {
       const migContext = await queryMeridianMIG(transcript);
       overridePrompt = getMeridianPrompt() + migContext;
     }
-    const response = await getAIResponse(transcript, history, deptNonStream, overridePrompt);
+    const response = await getAIResponse(transcript, history, deptNonStream, overridePrompt, sessionGatewayKeys.get(sessionId) || "");
     const aiTime = Date.now() - aiStart;
     console.log(`[meridian-voice] AI (${aiTime}ms): "${response}"`);
 
@@ -994,9 +1006,12 @@ app.post("/api/voice/stream", async (req, res) => {
 
   const { audio, transcript: clientTranscript, sessionId, voice } = req.body;
   const workspaceId = extractWorkspace(req);
-  // Track department per session
+  // Track department + gateway key per session
   if (sessionId && authMatch.dept) {
     sessionDepartments.set(sessionId, authMatch.dept);
+  }
+  if (sessionId && !sessionGatewayKeys.has(sessionId)) {
+    sessionGatewayKeys.set(sessionId, authMatch.gatewayKey || GATEWAY_API_KEY);
   }
   const selectedVoice = voice || "nova";
 
@@ -1065,7 +1080,7 @@ app.post("/api/voice/stream", async (req, res) => {
       console.log(`[meridian-voice/stream] Meridian house prompt + MIG context for workspace ${workspaceId}`);
     } else {
       const [ragContext, kpiContext] = await Promise.all([
-        queryCustomerKnowledge(transcript, dept),
+        queryCustomerKnowledge(transcript, dept, sessionGatewayKeys.get(sessionId) || ""),
         queryKPIDashboard(transcript),
       ]);
       systemPrompt = getSystemPrompt(dept) + ragContext + kpiContext;
@@ -1190,13 +1205,13 @@ async function speechToText(audioBuffer) {
 }
 
 // ============== Chat: Groq LLM ==============
-async function getAIResponse(userMessage, history, department, overridePrompt = null) {
+async function getAIResponse(userMessage, history, department, overridePrompt = null, apiKey = "") {
   let systemPrompt;
   if (overridePrompt) {
     systemPrompt = overridePrompt;
   } else {
     const [ragContext, kpiContext] = await Promise.all([
-      queryCustomerKnowledge(userMessage, department),
+      queryCustomerKnowledge(userMessage, department, apiKey),
       queryKPIDashboard(userMessage),
     ]);
     systemPrompt = getSystemPrompt(department) + ragContext + kpiContext;
@@ -1380,6 +1395,7 @@ app.post("/api/session/end", async (req, res) => {
     .catch(e => console.warn(`[meridian-voice] End-call summary failed: ${e.message}`));
 
   sessions.delete(sessionId);
+  sessionGatewayKeys.delete(sessionId);
   console.log(`[meridian-voice] Session ended by client: ${sessionId}`);
   res.json({ ok: true, summary: isMeridianWorkspace(workspaceId) });
 });
@@ -1395,6 +1411,7 @@ setInterval(() => {
       generateSessionSummary(workspaceId, id, session.history)
         .catch(e => console.warn(`[meridian-voice] Stale session summary failed: ${e.message}`));
       sessions.delete(id);
+      sessionGatewayKeys.delete(id);
     }
   }
 }, 30 * 60 * 1000);
