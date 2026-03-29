@@ -851,7 +851,7 @@
             <option value="">Loading...</option>
           </select>
         </div>
-        <button id="trainVoiceBtn" class="end-call-btn" style="border-color:var(--accent);color:var(--accent);">Train Voice</button>
+        <button id="trainVoiceBtn" class="end-call-btn" style="border-color:var(--border-color);color:var(--text-muted);opacity:0.7;cursor:default;" title="Voice cloning coming soon">Clone Voice (Coming Soon)</button>
         <button id="endCallBtn" class="end-call-btn" style="display:none;">End Call</button>
       </div>
       <div class="powered-by">Powered by Meridian AI</div>
@@ -867,31 +867,32 @@
     </div>
   </div>
 
-  <!-- Voice Training Overlay -->
+  <!-- Voice Training Overlay (Coming Soon) -->
   <div id="trainOverlay" class="summary-overlay hidden">
     <div class="summary-card" style="max-width:420px;">
-      <h2 class="summary-title">Train Voice</h2>
-      <p class="summary-content" style="text-align:center;margin-bottom:16px;">
-        Record 10-15 seconds of natural speech. Read the text below clearly.
-      </p>
-      <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:10px;padding:14px;margin-bottom:20px;font-family:Rajdhani,sans-serif;font-size:0.95rem;color:var(--text-secondary);line-height:1.6;">
-        "Hi, my name is Oracle and I work at Meridian AI. We help businesses build custom AI systems that listen, remember, and act. I'm excited to learn more about what you're working on."
-      </div>
-      <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
-        <div id="trainStatus" style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:0.15em;color:var(--text-muted);">READY</div>
-        <button id="trainRecordBtn" class="auth-button" style="padding:14px 40px;font-size:1.1rem;">Hold to Record</button>
-        <div id="trainPreview" style="display:none;width:100%;margin-top:8px;">
-          <div style="display:flex;gap:8px;justify-content:center;margin-top:8px;">
-            <button id="trainPlayBtn" class="end-call-btn" style="border-color:var(--accent);color:var(--accent);">Play Back</button>
-            <button id="trainTestBtn" class="end-call-btn" style="border-color:var(--accent);color:var(--accent);">Test Clone</button>
-            <button id="trainSaveBtn" class="auth-button" style="padding:8px 24px;font-size:0.9rem;">Save Voice</button>
-          </div>
-          <div id="trainTestStatus" style="font-family:Rajdhani,sans-serif;font-size:0.85rem;color:var(--text-muted);margin-top:8px;text-align:center;"></div>
-        </div>
-        <input id="trainVoiceName" type="text" placeholder="Voice name (e.g. alex)" value="oracle" style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:10px;padding:10px 16px;color:var(--text-primary);font-family:Rajdhani,sans-serif;font-size:1rem;text-align:center;width:200px;letter-spacing:0.1em;">
+      <h2 class="summary-title">Voice Cloning</h2>
+      <div style="text-align:center;padding:20px 0;">
+        <div style="font-size:2.5rem;margin-bottom:12px;">&#127908;</div>
+        <p class="summary-content" style="margin-bottom:16px;font-size:1.05rem;">
+          Voice cloning is coming soon.
+        </p>
+        <p style="font-family:Rajdhani,sans-serif;font-size:0.9rem;color:var(--text-muted);line-height:1.6;max-width:320px;margin:0 auto 20px;">
+          You'll be able to record a short audio sample and Oracle will respond in your cloned voice. Powered by Chatterbox TTS (open-source, MIT licensed).
+        </p>
         <button id="trainCloseBtn" class="end-call-btn" style="margin-top:8px;">Back to Chat</button>
       </div>
     </div>
+  </div>
+  <!-- Hidden elements referenced by existing JS (prevents errors) -->
+  <div style="display:none;">
+    <div id="trainStatus"></div>
+    <button id="trainRecordBtn"></button>
+    <div id="trainPreview"></div>
+    <button id="trainPlayBtn"></button>
+    <button id="trainTestBtn"></button>
+    <button id="trainSaveBtn"></button>
+    <div id="trainTestStatus"></div>
+    <input id="trainVoiceName" value="oracle">
   </div>
 
   <script>
