@@ -3,7 +3,9 @@ import express from "express";
 import { OpenAI, toFile } from "openai";
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { fileURLToPath } from "url";
+import { EdgeTTS } from "node-edge-tts";
 import { initBridge, recordExchange, recordLead, cleanupSessions } from "./agentvox-bridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -971,8 +973,11 @@ app.post("/api/voice", async (req, res) => {
     try {
       if (selectedVoice.startsWith("chatterbox:")) {
         responseAudio = await chatterboxTTS(response, selectedVoice.replace("chatterbox:", ""));
+      } else if (selectedVoice.startsWith("edge:")) {
+        responseAudio = await edgeTTS(response, selectedVoice.replace("edge:", ""));
       } else {
-        responseAudio = await textToSpeech(response, selectedVoice);
+        // Try Edge-TTS first (free, high quality), fall back to OpenAI
+        responseAudio = await edgeTTS(response) || await textToSpeech(response, selectedVoice);
       }
     } catch (e) {
       console.warn(`[meridian-voice] TTS failed, returning text-only: ${e.message}`);
@@ -1115,12 +1120,14 @@ app.post("/api/voice/stream", async (req, res) => {
         const ttsStart = Date.now();
         let audioData = null;
         try {
-          // Use Chatterbox for cloned voices, OpenAI for standard, null for browser fallback
+          // Use Chatterbox for cloned voices, Edge-TTS for edge: prefix, else Edge-TTS → OpenAI fallback
           if (selectedVoice.startsWith("chatterbox:")) {
             const cbVoice = selectedVoice.replace("chatterbox:", "");
             audioData = await chatterboxTTS(sentence, cbVoice);
+          } else if (selectedVoice.startsWith("edge:")) {
+            audioData = await edgeTTS(sentence, selectedVoice.replace("edge:", ""));
           } else {
-            audioData = await textToSpeech(sentence, selectedVoice);
+            audioData = await edgeTTS(sentence) || await textToSpeech(sentence, selectedVoice);
           }
         } catch (e) {
           console.warn(`[meridian-voice/stream] TTS failed for sentence: ${e.message}`);
@@ -1146,8 +1153,10 @@ app.post("/api/voice/stream", async (req, res) => {
       try {
         if (selectedVoice.startsWith("chatterbox:")) {
           audioData = await chatterboxTTS(sentenceBuffer.trim(), selectedVoice.replace("chatterbox:", ""));
+        } else if (selectedVoice.startsWith("edge:")) {
+          audioData = await edgeTTS(sentenceBuffer.trim(), selectedVoice.replace("edge:", ""));
         } else {
-          audioData = await textToSpeech(sentenceBuffer.trim(), selectedVoice);
+          audioData = await edgeTTS(sentenceBuffer.trim()) || await textToSpeech(sentenceBuffer.trim(), selectedVoice);
         }
       } catch (e) {
         console.warn(`[meridian-voice/stream] TTS failed for final chunk: ${e.message}`);
@@ -1267,6 +1276,70 @@ async function textToSpeech(text, voice = "nova", useCache = true) {
   }
 }
 
+// ============== TTS: Edge-TTS (free Microsoft voices, no API key) ==============
+// Edge-TTS voices for UK English:
+//   en-GB-SoniaNeural (female, default — closest to Google UK Female)
+//   en-GB-RyanNeural (male)
+//   en-GB-LibbyNeural (female, warm)
+//   en-GB-MaisieNeural (female, young)
+// Also available: en-US-*, en-AU-*, en-IN-*, plus 300+ other voices
+
+const EDGE_TTS_VOICES = {
+  "en-GB-SoniaNeural":  { name: "Sonia (UK Female)",  lang: "en-GB", gender: "female" },
+  "en-GB-RyanNeural":   { name: "Ryan (UK Male)",     lang: "en-GB", gender: "male" },
+  "en-GB-LibbyNeural":  { name: "Libby (UK Female)",  lang: "en-GB", gender: "female" },
+  "en-GB-MaisieNeural": { name: "Maisie (UK Female)", lang: "en-GB", gender: "female" },
+  "en-US-JennyNeural":  { name: "Jenny (US Female)",  lang: "en-US", gender: "female" },
+  "en-US-GuyNeural":    { name: "Guy (US Male)",      lang: "en-US", gender: "male" },
+  "en-US-AriaNeural":   { name: "Aria (US Female)",   lang: "en-US", gender: "female" },
+  "en-US-DavisNeural":  { name: "Davis (US Male)",    lang: "en-US", gender: "male" },
+};
+
+const DEFAULT_EDGE_VOICE = "en-GB-SoniaNeural";
+
+async function edgeTTS(text, voice = DEFAULT_EDGE_VOICE) {
+  if (!text || text.trim().length === 0) return null;
+
+  // Check cache first (reuses the same cache as OpenAI TTS)
+  const cacheKey = `edge:${voice}`;
+  const cached = getFromCache(text, cacheKey);
+  if (cached) {
+    console.log(`[meridian-voice] Edge-TTS cache HIT for: "${text.substring(0, 30)}..."`);
+    return Buffer.from(cached, "base64");
+  }
+
+  // Determine lang from voice name (e.g. en-GB-SoniaNeural → en-GB)
+  const langMatch = voice.match(/^([a-z]{2}-[A-Z]{2})/);
+  const lang = langMatch ? langMatch[1] : "en-GB";
+
+  const tts = new EdgeTTS({
+    voice,
+    lang,
+    outputFormat: "audio-24khz-48kbitrate-mono-mp3",
+    timeout: 15000,
+  });
+
+  // Write to temp file, read back as buffer, clean up
+  const tmpFile = path.join(os.tmpdir(), `edge-tts-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp3`);
+  try {
+    await tts.ttsPromise(text, tmpFile);
+    const buffer = fs.readFileSync(tmpFile);
+    fs.unlinkSync(tmpFile);
+
+    // Cache the result
+    if (text.length < 200) {
+      addToCache(text, cacheKey, buffer.toString("base64"));
+    }
+
+    return buffer;
+  } catch (e) {
+    console.warn(`[meridian-voice] Edge-TTS failed: ${e.message || e}`);
+    // Clean up temp file on error
+    try { fs.unlinkSync(tmpFile); } catch {}
+    return null;
+  }
+}
+
 // ============== TTS: Chatterbox (local voice cloning) ==============
 const CHATTERBOX_URL = process.env.CHATTERBOX_URL || "http://127.0.0.1:8766";
 
@@ -1332,12 +1405,21 @@ app.post("/api/train-voice/:name", async (req, res) => {
 
 // ============== Voice List ==============
 app.get("/api/voices", async (req, res) => {
+  // Build Edge-TTS voice list (always available — no API key needed)
+  const edgeVoices = Object.entries(EDGE_TTS_VOICES).map(([id, info]) => ({
+    id: `edge:${id}`,
+    name: info.name,
+    lang: info.lang,
+    gender: info.gender,
+    provider: "edge-tts",
+  }));
+
   try {
     const response = await fetch(`${CHATTERBOX_URL}/voices`, { signal: AbortSignal.timeout(3000) });
     const data = await response.json();
-    res.json({ ...data, chatterbox: true });
+    res.json({ ...data, chatterbox: true, edgeVoices });
   } catch {
-    res.json({ voices: ["browser-uk-female", "browser-uk-male"], chatterbox: false });
+    res.json({ voices: ["browser-uk-female", "browser-uk-male"], chatterbox: false, edgeVoices });
   }
 });
 
