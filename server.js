@@ -477,7 +477,7 @@ if (OPENAI_API_KEY) {
 // Middleware
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Workspace-Id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Workspace-Id");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -739,6 +739,7 @@ app.post("/api/auth/register", async (req, res) => {
     const data = await resp.json();
     if (!resp.ok) return res.status(resp.status).json(data);
     console.log(`[meridian-voice] Registered: ${email} → workspace ${data.workspaceId || data.workspace_id}`);
+    console.log(`[meridian-voice] NEW SIGNUP: ${email} (${companyName || "no company"})`);
     res.json({
       token: data.token,
       user: { id: data.userId || data.user_id, email, workspaceId: data.workspaceId || data.workspace_id, companyName: companyName || "" },
@@ -1460,6 +1461,38 @@ function extractSentences(text) {
   const lastPart = parts[parts.length - 1];
   return { sentences, remaining: lastPart };
 }
+
+// ============== Admin Auth + Active Sessions ==============
+
+// Admin login — validates password server-side, returns API key
+app.post("/api/admin/login", (req, res) => {
+  const { password } = req.body || {};
+  const ADMIN_PW = process.env.ADMIN_PASSWORD || "meridian-ops-2026";
+  if (!password || password !== ADMIN_PW) {
+    return res.status(401).json({ ok: false, error: "Invalid password" });
+  }
+  res.json({ ok: true, apiKey: KAAS_API_KEY || "" });
+});
+
+// Active sessions — returns currently in-memory sessions for the admin dashboard
+app.get("/api/admin/active-sessions", (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.replace("Bearer ", "") || "";
+  if (!token || token !== (KAAS_API_KEY || "")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const active = [];
+  for (const [id, session] of sessions.entries()) {
+    active.push({
+      session_id: id,
+      workspace_id: session.workspaceId || "demo",
+      exchange_count: Math.floor(session.history.length / 2),
+      last_active: new Date(session.lastAccess).toISOString(),
+      age_seconds: Math.round((Date.now() - session.lastAccess) / 1000),
+    });
+  }
+  res.json({ active_sessions: active, count: active.length });
+});
 
 // ============== Session End + Cleanup ==============
 
